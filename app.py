@@ -1,230 +1,223 @@
-# --- AÑADIR ESTO AL PRINCIPIO DESPUÉS DE LOS IMPORTS ---
-from nba_api.stats.library.http import NBAStatsHTTP
-
-# Configuración Anti-Bloqueo: Aumentar timeout y usar User-Agent real
-NBAStatsHTTP.headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Origin': 'https://www.nba.com',
-    'Referer': 'https://www.nba.com/'
-}
-# Aumentar el tiempo de espera antes de rendirse
-NBAStatsHTTP.timeout = 30
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
+import time
+import warnings
 from tensorflow.keras.models import load_model
 from datetime import datetime
 from nba_api.stats.endpoints import scoreboardv2
+from nba_api.stats.library.http import NBAStatsHTTP
 
-# --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(page_title="NBA AI Predictor", page_icon="🏀", layout="wide")
+# --- 0. CONFIGURACIÓN INICIAL ---
+warnings.filterwarnings('ignore')
+st.set_page_config(page_title="NBA AI Predictor 2026", page_icon="🏀", layout="wide")
 
-# --- CARGAR MODELOS Y DATOS ---
+# --- 1. CONFIGURACIÓN ANTI-BLOQUEO ---
+NBAStatsHTTP.timeout = 60 
+NBAStatsHTTP.headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Connection': 'keep-alive',
+    'Origin': 'https://www.nba.com',
+    'Referer': 'https://www.nba.com/',
+}
 
+# --- 2. CARGAR MODELOS Y DATOS ---
 @st.cache_resource
 def load_artifacts():
-    # compile=False evita errores de métricas entre versiones
+    # Modelo
     model = load_model('nba_model_dvp.h5', compile=False)
+    
+    # Artefactos
     scaler = joblib.load('nba_scaler.pkl')
     pos_map = joblib.load('pos_map.pkl')
     le_opp = joblib.load('opp_encoder.pkl')
     dvp_stats = pd.read_csv('defense_vs_position.csv')
     
-    # Cargar datos históricos
+    # Datos Históricos
     df = pd.read_csv('nba_data_final.csv')
     df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
     
-    # --- CORRECCIÓN DEL ERROR ---
-    # 1. Eliminar filas donde el nombre del jugador sea nulo (NaN)
+    # Limpieza
     df = df.dropna(subset=['PLAYER_NAME'])
-    # 2. Asegurar que todos los nombres sean texto (string)
     df['PLAYER_NAME'] = df['PLAYER_NAME'].astype(str)
     
-    return model, scaler, pos_map, le_opp, dvp_stats, df
+    # --- CÁLCULO DE PROMEDIOS TEMPORADA ACTUAL (2025-26) ---
+    inicio_temp_2026 = pd.to_datetime('2025-09-01')
+    df_2026 = df[df['GAME_DATE'] >= inicio_temp_2026].copy()
+    
+    # Diccionario: Jugador -> Minutos Promedio en 2026
+    promedio_minutos_2026 = df_2026.groupby('PLAYER_NAME')['MIN'].mean().to_dict()
+    
+    return model, scaler, pos_map, le_opp, dvp_stats, df, promedio_minutos_2026
 
-# Carga inicial
 try:
-    model, scaler, pos_map, le_opp, dvp_stats, df = load_artifacts()
+    model, scaler, pos_map, le_opp, dvp_stats, df, avg_min_2026 = load_artifacts()
 except Exception as e:
-    st.error(f"Error cargando archivos: {e}")
+    st.error(f"Error crítico cargando archivos: {e}")
     st.stop()
 
-# --- FUNCIONES AUXILIARES ---
+# --- 3. FUNCIONES AUXILIARES ---
+
+def obtener_scoreboard_seguro(fecha):
+    intentos = 0
+    while intentos < 3:
+        try:
+            board = scoreboardv2.ScoreboardV2(game_date=fecha, timeout=60)
+            games = board.get_data_frames()[0]
+            return games
+        except:
+            intentos += 1
+            time.sleep(1.5)
+    raise Exception("API NBA sin respuesta.")
 
 def get_defense_stats(rival, pos):
-    """Busca estadísticas defensivas del rival"""
     stats = dvp_stats[(dvp_stats['OPPONENT_ABBREV'] == rival) & (dvp_stats['POSITION'] == pos)]
     if stats.empty: return 20.0, 5.0, 5.0
     return stats.iloc[0]['OPP_ALLOW_PTS'], stats.iloc[0]['OPP_ALLOW_REB'], stats.iloc[0]['OPP_ALLOW_AST']
 
-def get_active_roster(team_id, min_minutes=20):
-    """Busca jugadores del equipo con minutos relevantes"""
-    # Filtramos por ID de equipo
-    team_df = df[df['TEAM_ID'] == team_id]
-    if team_df.empty: return []
+def get_active_roster(team_id, min_minutes):
+    """
+    Busca jugadores que ACTUALMENTE pertenezcan al equipo.
+    Lógica: El último partido registrado del jugador DEBE ser con este equipo.
+    """
+    # 1. Obtenemos lista de candidatos (cualquiera que haya jugado para este equipo alguna vez)
+    # Esto es rápido para filtrar la lista gigante
+    candidatos_df = df[df['TEAM_ID'] == team_id]
+    if candidatos_df.empty: return []
     
-    # Buscamos el último partido de cada jugador único
-    # y verificamos si sigue en el equipo y si juega suficientes minutos
-    roster = []
-    unique_players = team_df['PLAYER_NAME'].unique()
+    nombres_candidatos = candidatos_df['PLAYER_NAME'].unique()
+    roster_final = []
     
-    for p in unique_players:
-        p_data = team_df[team_df['PLAYER_NAME'] == p].sort_values('GAME_DATE').iloc[-1]
+    for p in nombres_candidatos:
+        # 2. VALIDACIÓN CRÍTICA:
+        # Buscamos el ÚLTIMO partido de este jugador en TODO el dataframe global (df),
+        # no solo en los partidos de este equipo.
+        ultimo_partido_global = df[df['PLAYER_NAME'] == p].sort_values('GAME_DATE').iloc[-1]
         
-        # Validamos que su último partido haya sido con este equipo
-        if p_data['TEAM_ID'] == team_id:
-            # Validamos minutos (Columna AVG_MIN_LAST_5 debe existir en tu csv)
-            if 'AVG_MIN_LAST_5' in p_data and p_data['AVG_MIN_LAST_5'] >= min_minutes:
-                roster.append(p)
-            elif 'AVG_MIN_LAST_5' not in p_data:
-                # Si no existe la columna, lo agregamos por si acaso
-                roster.append(p)
+        # 3. Si su último partido global FUE con este equipo, entonces sigue aquí.
+        if ultimo_partido_global['TEAM_ID'] == team_id:
+            
+            # 4. Aplicamos el filtro de minutos de la temporada actual
+            promedio_real = avg_min_2026.get(p, 0)
+            if promedio_real >= min_minutes:
+                roster_final.append(p)
                 
-    return roster
+    return roster_final
 
 def predict_player(name, rival, is_home):
-    """Ejecuta la predicción para un jugador"""
-    # 1. Buscar datos recientes
+    # Datos recientes
     player_data = df[df['PLAYER_NAME'] == name].sort_values(by='GAME_DATE').tail(1)
     if player_data.empty: return None
     
-    # 2. Preparar inputs
+    # Inputs
     p_id = player_data['PLAYER_ID'].values[0]
-    pos = pos_map.get(p_id, 'F') # Si falla el mapa, usamos 'F'
-    
+    pos = pos_map.get(p_id, 'F')
     opp_pts, opp_reb, opp_ast = get_defense_stats(rival, pos)
     
-    # 3. Construir fila de características
-    # Deben coincidir con las usadas en el entrenamiento
+    # Features
     stats_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'MIN', 'FG_PCT', 'FG3_PCT']
     feats = [f'AVG_{s}_LAST_5' for s in stats_cols]
     
-    try:
-        row = player_data[feats].copy()
-    except KeyError:
-        return None # Faltan columnas
+    try: row = player_data[feats].copy()
+    except: return None
         
     row['IS_HOME'] = 1 if is_home else 0
     row['OPP_ALLOW_PTS'] = opp_pts
     row['OPP_ALLOW_REB'] = opp_reb
     row['OPP_ALLOW_AST'] = opp_ast
     
-    # Orden correcto
-    features_defense = ['OPP_ALLOW_PTS', 'OPP_ALLOW_REB', 'OPP_ALLOW_AST']
-    final_cols = feats + ['IS_HOME'] + features_defense
+    final_cols = feats + ['IS_HOME', 'OPP_ALLOW_PTS', 'OPP_ALLOW_REB', 'OPP_ALLOW_AST']
     
-    # 4. Predecir
     try:
         X_scaled = scaler.transform(row[final_cols])
         pred = model.predict(X_scaled, verbose=0)
         return pred[0], pos, opp_pts
-    except:
-        return None
+    except: return None
 
-# --- INTERFAZ GRÁFICA ---
-st.title("🏀 NBA AI Predictor")
+# --- 4. INTERFAZ ---
+
+st.title("🏀 NBA AI Predictor 2026")
+st.markdown("Predicciones basadas en **Roster Actual** y **Defensa por Posición**.")
 
 tab1, tab2 = st.tabs(["🔮 Predicción Individual", "📅 Cartelera de Hoy"])
 
-# --- PESTAÑA 1: BUSCADOR ---
+# --- PESTAÑA 1 ---
 with tab1:
     col1, col2, col3 = st.columns(3)
     with col1:
         jugador = st.selectbox("Jugador", sorted(df['PLAYER_NAME'].unique()))
     with col2:
-        # Lista de equipos rivales
-        rivales = sorted(dvp_stats['OPPONENT_ABBREV'].unique())
-        rival = st.selectbox("Rival", rivales)
+        rival = st.selectbox("Rival", sorted(dvp_stats['OPPONENT_ABBREV'].unique()))
     with col3:
         localia = st.radio("Condición", ["Casa 🏠", "Visita ✈️"])
 
-    if st.button("Analizar Jugador"):
-        is_home = True if localia == "Casa 🏠" else False
-        res = predict_player(jugador, rival, is_home)
-        
+    if st.button("Analizar Jugador", type="primary"):
+        res = predict_player(jugador, rival, localia == "Casa 🏠")
         if res:
-            (pts, reb, ast), pos, opp_allowed = res
-            
-            st.markdown(f"### 📊 Proyección: {jugador} ({pos})")
-            
-            # Tarjetas de números
+            (pts, reb, ast), pos, opp = res
+            st.markdown(f"### 📊 {jugador} ({pos})")
             c1, c2, c3 = st.columns(3)
             c1.metric("Puntos", f"{pts:.1f}")
             c2.metric("Rebotes", f"{reb:.1f}")
             c3.metric("Asistencias", f"{ast:.1f}")
-            
-            # Contexto defensivo
-            if opp_allowed < 15: # Umbral de escudo estricto
-                st.warning(f"🛡️ **Defensa Élite:** {rival} solo permite {opp_allowed:.1f} pts a su posición.")
-            elif opp_allowed > 25:
-                st.success(f"🔥 **Defensa Débil:** {rival} permite {opp_allowed:.1f} pts (Matchup favorable).")
-            else:
-                st.info(f"⚖️ **Defensa Promedio:** {rival} permite {opp_allowed:.1f} pts.")
-
+            if opp < 15: st.warning("🛡️ Rival difícil.")
+            elif opp > 25: st.success("🔥 Rival fácil.")
         else:
-            st.error("Datos insuficientes para predecir.")
+            st.error("Datos insuficientes.")
 
-# --- SUSTITUYE EL BLOQUE DE LA PESTAÑA 2 CON ESTO ---
+# --- PESTAÑA 2 ---
 with tab2:
-    st.write("Generando predicciones automáticas para los partidos del día...")
+    col_slide, col_b = st.columns([2,1])
+    with col_slide:
+        min_filter = st.slider("Minutos Promedio (Temp 2025-26):", 10, 40, 25)
     
-    if st.button("🔄 Cargar Partidos de Hoy"):
+    if st.button("🔄 Cargar Partidos"):
         today = datetime.now().strftime('%Y-%m-%d')
         # today = "2024-12-04" # Descomentar para pruebas
         
-        try:
-            # Intentamos conectar con la API
-            board = scoreboardv2.ScoreboardV2(game_date=today)
-            games = board.get_data_frames()[0]
-            
-            if games.empty:
-                st.warning(f"No hay partidos programados para hoy ({today}).")
-            else:
-                st.success(f"Se encontraron {len(games)} partidos.")
-                
-                # --- BUCLE DE PARTIDOS (Tu código original) ---
-                for i, game in games.iterrows():
-                    home_id = game['HOME_TEAM_ID']
-                    away_id = game['VISITOR_TEAM_ID']
-                    
-                    try: h_abb = df[df['TEAM_ID'] == home_id]['TEAM_ABBREVIATION'].iloc[0]
-                    except: h_abb = "HOME"
-                    try: v_abb = df[df['TEAM_ID'] == away_id]['TEAM_ABBREVIATION'].iloc[0]
-                    except: v_abb = "AWAY"
-                    
-                    with st.expander(f"🏀 {v_abb} @ {h_abb}", expanded=True):
-                        col_away, col_home = st.columns(2)
+        with st.spinner(f'Buscando partidos para {today}...'):
+            try:
+                games = obtener_scoreboard_seguro(today)
+                if games.empty:
+                    st.warning("No hay partidos hoy.")
+                else:
+                    st.success(f"✅ {len(games)} partidos encontrados.")
+                    for i, game in games.iterrows():
+                        h_id = game['HOME_TEAM_ID']
+                        a_id = game['VISITOR_TEAM_ID']
                         
-                        # --- EQUIPO VISITANTE ---
-                        with col_away:
-                            st.markdown(f"**✈️ {v_abb} (Visita)**")
-                            roster = get_active_roster(away_id, min_minutes=20)
-                            if not roster: st.caption("Sin datos de jugadores.")
-                            for p in roster:
-                                res = predict_player(p, h_abb, False)
-                                if res:
-                                    (pts, reb, ast), pos, opp_pts = res
-                                    icon = "🛡️" if opp_pts < 15 else ""
-                                    st.write(f"{icon} **{p}** ({pos}): {pts:.1f} PTS | {reb:.1f} REB | {ast:.1f} AST")
-
-                        # --- EQUIPO LOCAL ---
-                        with col_home:
-                            st.markdown(f"**🏠 {h_abb} (Casa)**")
-                            roster = get_active_roster(home_id, min_minutes=20)
-                            if not roster: st.caption("Sin datos de jugadores.")
-                            for p in roster:
-                                res = predict_player(p, v_abb, True)
-                                if res:
-                                    (pts, reb, ast), pos, opp_pts = res
-                                    icon = "🛡️" if opp_pts < 15 else ""
-                                    st.write(f"{icon} **{p}** ({pos}): {pts:.1f} PTS | {reb:.1f} REB | {ast:.1f} AST")
-
-        except Exception as e:
-            # MENSAJE DE ERROR AMIGABLE
-            st.error("⚠️ La API de la NBA ha rechazado la conexión temporalmente.")
-            st.code(f"Error técnico: {e}")
-            st.info("💡 Consejo: Intenta de nuevo en 1 minuto. Si estás en Streamlit Cloud, los servidores de la NBA a veces bloquean estas IPs compartidas.")
+                        try: h_abb = df[df['TEAM_ID'] == h_id]['TEAM_ABBREVIATION'].iloc[0]
+                        except: h_abb = "HOME"
+                        try: a_abb = df[df['TEAM_ID'] == a_id]['TEAM_ABBREVIATION'].iloc[0]
+                        except: a_abb = "AWAY"
+                        
+                        with st.expander(f"🏀 {a_abb} @ {h_abb}", expanded=True):
+                            c_away, c_home = st.columns(2)
+                            
+                            with c_away:
+                                st.markdown(f"**✈️ {a_abb}**")
+                                roster = get_active_roster(a_id, min_filter)
+                                if not roster: st.caption("Nadie cumple el filtro.")
+                                for p in roster:
+                                    res = predict_player(p, h_abb, False)
+                                    if res:
+                                        (pts, reb, ast), pos, opp = res
+                                        icon = "🛡️" if opp < 15 else ""
+                                        st.write(f"{icon} **{p}** ({pos}): {pts:.1f} PTS | {reb:.1f} REB")
+                            
+                            with c_home:
+                                st.markdown(f"**🏠 {h_abb}**")
+                                roster = get_active_roster(h_id, min_filter)
+                                if not roster: st.caption("Nadie cumple el filtro.")
+                                for p in roster:
+                                    res = predict_player(p, a_abb, True)
+                                    if res:
+                                        (pts, reb, ast), pos, opp = res
+                                        icon = "🛡️" if opp < 15 else ""
+                                        st.write(f"{icon} **{p}** ({pos}): {pts:.1f} PTS | {reb:.1f} REB")
+            except Exception as e:
+                st.error("Error de conexión.")
+                st.code(e)
