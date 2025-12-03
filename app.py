@@ -2,222 +2,241 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import time
 import warnings
 from tensorflow.keras.models import load_model
 from datetime import datetime
-from nba_api.stats.endpoints import scoreboardv2
-from nba_api.stats.library.http import NBAStatsHTTP
 
-# --- 0. CONFIGURACIÓN INICIAL ---
+# --- 0. CONFIGURACIÓN ---
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="NBA AI Predictor 2026", page_icon="🏀", layout="wide")
+st.set_page_config(page_title="NBA AI Simulator", page_icon="🏀", layout="wide")
 
-# --- 1. CONFIGURACIÓN ANTI-BLOQUEO ---
-NBAStatsHTTP.timeout = 60 
-NBAStatsHTTP.headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Connection': 'keep-alive',
-    'Origin': 'https://www.nba.com',
-    'Referer': 'https://www.nba.com/',
-}
-
-# --- 2. CARGAR MODELOS Y DATOS ---
+# --- 1. CARGA DE ARTEFACTOS (SOLO JUGADORES) ---
 @st.cache_resource
 def load_artifacts():
-    # Modelo
-    model = load_model('nba_model_dvp.h5', compile=False)
+    try:
+        # Cargamos solo lo necesario para predecir jugadores
+        # compile=False es vital para evitar errores de versión
+        model = load_model('nba_model_dvp.h5', compile=False)
+        scaler = joblib.load('nba_scaler.pkl')
+        pos_map = joblib.load('pos_map.pkl')
+        dvp_stats = pd.read_csv('defense_vs_position.csv')
+        
+        # Datos históricos
+        df = pd.read_csv('nba_data_final.csv')
+        df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
+        # Limpieza de nombres nulos
+        df = df.dropna(subset=['PLAYER_NAME'])
+        df['PLAYER_NAME'] = df['PLAYER_NAME'].astype(str)
+        
+        # Filtro de minutos (Temporada 2025-26)
+        inicio_26 = pd.to_datetime('2025-09-01')
+        df_26 = df[df['GAME_DATE'] >= inicio_26].copy()
+        avg_min_26 = df_26.groupby('PLAYER_NAME')['MIN'].mean().to_dict()
+        
+        return model, scaler, pos_map, dvp_stats, df, avg_min_26
     
-    # Artefactos
-    scaler = joblib.load('nba_scaler.pkl')
-    pos_map = joblib.load('pos_map.pkl')
-    le_opp = joblib.load('opp_encoder.pkl')
-    dvp_stats = pd.read_csv('defense_vs_position.csv')
-    
-    # Datos Históricos
-    df = pd.read_csv('nba_data_final.csv')
-    df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
-    
-    # Limpieza
-    df = df.dropna(subset=['PLAYER_NAME'])
-    df['PLAYER_NAME'] = df['PLAYER_NAME'].astype(str)
-    
-    # --- CÁLCULO DE PROMEDIOS TEMPORADA ACTUAL (2025-26) ---
-    inicio_temp_2026 = pd.to_datetime('2025-09-01')
-    df_2026 = df[df['GAME_DATE'] >= inicio_temp_2026].copy()
-    
-    # Diccionario: Jugador -> Minutos Promedio en 2026
-    promedio_minutos_2026 = df_2026.groupby('PLAYER_NAME')['MIN'].mean().to_dict()
-    
-    return model, scaler, pos_map, le_opp, dvp_stats, df, promedio_minutos_2026
+    except Exception as e:
+        st.error(f"Error cargando archivos: {e}")
+        return None, None, None, None, None, None
 
-try:
-    model, scaler, pos_map, le_opp, dvp_stats, df, avg_min_2026 = load_artifacts()
-except Exception as e:
-    st.error(f"Error crítico cargando archivos: {e}")
+# Ejecutar carga
+model, scaler, pos_map, dvp_stats, df, avg_min_26 = load_artifacts()
+
+if df is None:
+    st.warning("⚠️ Faltan archivos en la carpeta. Asegúrate de tener: nba_model_dvp.h5, nba_scaler.pkl, nba_data_final.csv, etc.")
     st.stop()
 
-# --- 3. FUNCIONES AUXILIARES ---
-
-def obtener_scoreboard_seguro(fecha):
-    intentos = 0
-    while intentos < 3:
-        try:
-            board = scoreboardv2.ScoreboardV2(game_date=fecha, timeout=60)
-            games = board.get_data_frames()[0]
-            return games
-        except:
-            intentos += 1
-            time.sleep(1.5)
-    raise Exception("API NBA sin respuesta.")
+# --- 2. FUNCIONES DE LÓGICA ---
 
 def get_defense_stats(rival, pos):
+    """Busca qué tan bien defiende el rival a esa posición"""
     stats = dvp_stats[(dvp_stats['OPPONENT_ABBREV'] == rival) & (dvp_stats['POSITION'] == pos)]
     if stats.empty: return 20.0, 5.0, 5.0
     return stats.iloc[0]['OPP_ALLOW_PTS'], stats.iloc[0]['OPP_ALLOW_REB'], stats.iloc[0]['OPP_ALLOW_AST']
 
-def get_active_roster(team_id, min_minutes):
-    """
-    Busca jugadores que ACTUALMENTE pertenezcan al equipo.
-    Lógica: El último partido registrado del jugador DEBE ser con este equipo.
-    """
-    # 1. Obtenemos lista de candidatos (cualquiera que haya jugado para este equipo alguna vez)
-    # Esto es rápido para filtrar la lista gigante
-    candidatos_df = df[df['TEAM_ID'] == team_id]
-    if candidatos_df.empty: return []
+def get_active_roster(team_abbr, min_minutes):
+    """Obtiene los jugadores activos de un equipo por su abreviatura (ej: LAL)"""
+    # 1. Buscar el ID del equipo basado en la abreviatura
+    try:
+        team_id = df[df['TEAM_ABBREVIATION'] == team_abbr]['TEAM_ID'].iloc[0]
+    except:
+        return [] # Equipo no encontrado en el CSV
     
-    nombres_candidatos = candidatos_df['PLAYER_NAME'].unique()
-    roster_final = []
+    # 2. Filtrar dataframe
+    team_df = df[df['TEAM_ID'] == team_id]
+    if team_df.empty: return []
     
-    for p in nombres_candidatos:
-        # 2. VALIDACIÓN CRÍTICA:
-        # Buscamos el ÚLTIMO partido de este jugador en TODO el dataframe global (df),
-        # no solo en los partidos de este equipo.
-        ultimo_partido_global = df[df['PLAYER_NAME'] == p].sort_values('GAME_DATE').iloc[-1]
+    roster = []
+    for p in team_df['PLAYER_NAME'].unique():
+        # Validar que su último partido registrado sea con este equipo
+        last_game = df[df['PLAYER_NAME'] == p].sort_values('GAME_DATE').iloc[-1]
         
-        # 3. Si su último partido global FUE con este equipo, entonces sigue aquí.
-        if ultimo_partido_global['TEAM_ID'] == team_id:
-            
-            # 4. Aplicamos el filtro de minutos de la temporada actual
-            promedio_real = avg_min_2026.get(p, 0)
-            if promedio_real >= min_minutes:
-                roster_final.append(p)
-                
-    return roster_final
+        if last_game['TEAM_ID'] == team_id:
+            # Validar minutos en la temporada actual (si tiene datos)
+            if avg_min_26.get(p, 0) >= min_minutes:
+                roster.append(p)
+    return roster
 
 def predict_player(name, rival, is_home):
-    # Datos recientes
-    player_data = df[df['PLAYER_NAME'] == name].sort_values(by='GAME_DATE').tail(1)
-    if player_data.empty: return None
+    # 1. Historial
+    player_history = df[df['PLAYER_NAME'] == name].sort_values(by='GAME_DATE')
+    if player_history.empty: return None
     
-    # Inputs
-    p_id = player_data['PLAYER_ID'].values[0]
+    # Últimos 5 partidos (para mostrar en tabla si es necesario)
+    last_5_games = player_history.tail(5).sort_values(by='GAME_DATE', ascending=False).copy()
+    
+    last_game_row = player_history.tail(1)
+    
+    # 2. Contexto (Fatiga simulada)
+    today = pd.to_datetime(datetime.now().strftime('%Y-%m-%d'))
+    last_date = last_game_row['GAME_DATE'].values[0]
+    
+    # Cálculo de días de descanso (min 1, max 7 para normalizar)
+    days_rest = max(1, min((today - last_date).days, 7))
+    is_b2b = 1 if days_rest == 1 else 0
+    
+    # 3. Inputs
+    p_id = last_game_row['PLAYER_ID'].values[0]
     pos = pos_map.get(p_id, 'F')
     opp_pts, opp_reb, opp_ast = get_defense_stats(rival, pos)
     
-    # Features
-    stats_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'MIN', 'FG_PCT', 'FG3_PCT']
-    feats = [f'AVG_{s}_LAST_5' for s in stats_cols]
+    # 4. Features (Mismo orden que entrenamiento)
+    stats_base = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'MIN', 'FG_PCT', 'FG3_PCT']
+    feats_short = [f'AVG_{s}_LAST_5' for s in stats_base]
+    trends = ['TREND_PTS', 'TREND_FG_PCT']
     
-    try: row = player_data[feats].copy()
+    try: row = last_game_row[feats_short].copy()
     except: return None
-        
+    
+    # Añadir tendencias si existen en el CSV
+    for t in trends: 
+        row[t] = last_game_row[t].values[0] if t in last_game_row else 0
+
     row['IS_HOME'] = 1 if is_home else 0
+    row['DAYS_REST'] = days_rest
+    row['IS_B2B'] = is_b2b
     row['OPP_ALLOW_PTS'] = opp_pts
     row['OPP_ALLOW_REB'] = opp_reb
     row['OPP_ALLOW_AST'] = opp_ast
     
-    final_cols = feats + ['IS_HOME', 'OPP_ALLOW_PTS', 'OPP_ALLOW_REB', 'OPP_ALLOW_AST']
+    # Orden final de columnas para la red neuronal
+    final_cols = feats_short + trends + ['IS_HOME', 'DAYS_REST', 'IS_B2B', 'OPP_ALLOW_PTS', 'OPP_ALLOW_REB', 'OPP_ALLOW_AST']
     
     try:
         X_scaled = scaler.transform(row[final_cols])
         pred = model.predict(X_scaled, verbose=0)
-        return pred[0], pos, opp_pts
+        
+        # Recuperamos la tendencia de puntos para mostrarla en la UI
+        trend_val = last_game_row.get('TREND_PTS', pd.Series([0])).values[0]
+        
+        return pred[0], pos, opp_pts, is_b2b, trend_val, last_5_games, p_id
     except: return None
 
-# --- 4. INTERFAZ ---
+# --- 3. INTERFAZ GRÁFICA ---
 
-st.title("🏀 NBA AI Predictor 2026")
-st.markdown("Predicciones basadas en **Roster Actual** y **Defensa por Posición**.")
+st.title("🧠 NBA AI Simulator")
 
-tab1, tab2 = st.tabs(["🔮 Predicción Individual", "📅 Cartelera de Hoy"])
+tab1, tab2 = st.tabs(["👤 Oráculo Individual", "🆚 Enfrentamiento de Equipos"])
 
-# --- PESTAÑA 1 ---
+# --- PESTAÑA 1: INDIVIDUAL ---
 with tab1:
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        jugador = st.selectbox("Jugador", sorted(df['PLAYER_NAME'].unique()))
-    with col2:
-        rival = st.selectbox("Rival", sorted(dvp_stats['OPPONENT_ABBREV'].unique()))
-    with col3:
-        localia = st.radio("Condición", ["Casa 🏠", "Visita ✈️"])
-
-    if st.button("Analizar Jugador", type="primary"):
-        res = predict_player(jugador, rival, localia == "Casa 🏠")
-        if res:
-            (pts, reb, ast), pos, opp = res
-            st.markdown(f"### 📊 {jugador} ({pos})")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Puntos", f"{pts:.1f}")
-            c2.metric("Rebotes", f"{reb:.1f}")
-            c3.metric("Asistencias", f"{ast:.1f}")
-            if opp < 15: st.warning("🛡️ Rival difícil.")
-            elif opp > 25: st.success("🔥 Rival fácil.")
-        else:
-            st.error("Datos insuficientes.")
-
-# --- PESTAÑA 2 ---
-with tab2:
-    col_slide, col_b = st.columns([2,1])
-    with col_slide:
-        min_filter = st.slider("Minutos Promedio (Temp 2025-26):", 10, 40, 25)
+    c1, c2, c3 = st.columns(3)
+    # Listas ordenadas
+    all_players = sorted(df['PLAYER_NAME'].unique())
+    all_teams = sorted(dvp_stats['OPPONENT_ABBREV'].unique())
     
-    if st.button("🔄 Cargar Partidos"):
-        today = datetime.now().strftime('%Y-%m-%d')
-        # today = "2024-12-04" # Descomentar para pruebas
+    jug = c1.selectbox("Jugador", all_players)
+    riv = c2.selectbox("Rival", all_teams)
+    loc = c3.radio("Sede", ["Casa", "Visita"], key="p1")
+    
+    if st.button("Analizar Jugador"):
+        res = predict_player(jug, riv, loc == "Casa")
+        if res:
+            (pts, reb, ast), pos, opp, b2b, trend, last_5, pid = res
+            
+            # Encabezado con Foto
+            col_img, col_info = st.columns([1, 4])
+            with col_img:
+                img_url = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{int(pid)}.png"
+                st.image(img_url, use_container_width=True)
+            with col_info:
+                st.subheader(f"{jug} ({pos}) vs {riv}")
+                if b2b: st.warning("⚠️ Juega cansado (Back-to-Back)")
+                
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Puntos", f"{pts:.1f}", delta=f"{trend:.1f}")
+                m2.metric("Rebotes", f"{reb:.1f}")
+                m3.metric("Asistencias", f"{ast:.1f}")
+            
+            st.divider()
+            st.caption("Historial reciente (Últimos 5):")
+            # Mostramos tabla limpia
+            st.dataframe(last_5[['GAME_DATE', 'MATCHUP', 'PTS', 'REB', 'AST']], hide_index=True)
+        else:
+            st.error("Datos insuficientes para este jugador.")
+
+# --- PESTAÑA 2: ENFRENTAMIENTO (MANUAL) ---
+with tab2:
+    st.write("Simula el rendimiento de los jugadores en un partido específico.")
+    
+    # 1. Filtro de Minutos
+    min_filter = st.slider("Filtrar jugadores con media de minutos >", 10, 40, 25)
+    st.markdown("---")
+    
+    # 2. Selectores de Equipos
+    col_v, col_vs, col_l = st.columns([2, 1, 2])
+    equipos = sorted(df['TEAM_ABBREVIATION'].unique())
+    
+    with col_v:
+        visita = st.selectbox("✈️ Visitante", equipos, index=0)
+    with col_vs:
+        st.markdown("<h2 style='text-align: center; margin-top: 20px;'>VS</h2>", unsafe_allow_html=True)
+    with col_l:
+        local = st.selectbox("🏠 Local", equipos, index=1)
         
-        with st.spinner(f'Buscando partidos para {today}...'):
-            try:
-                games = obtener_scoreboard_seguro(today)
-                if games.empty:
-                    st.warning("No hay partidos hoy.")
-                else:
-                    st.success(f"✅ {len(games)} partidos encontrados.")
-                    for i, game in games.iterrows():
-                        h_id = game['HOME_TEAM_ID']
-                        a_id = game['VISITOR_TEAM_ID']
-                        
-                        try: h_abb = df[df['TEAM_ID'] == h_id]['TEAM_ABBREVIATION'].iloc[0]
-                        except: h_abb = "HOME"
-                        try: a_abb = df[df['TEAM_ID'] == a_id]['TEAM_ABBREVIATION'].iloc[0]
-                        except: a_abb = "AWAY"
-                        
-                        with st.expander(f"🏀 {a_abb} @ {h_abb}", expanded=True):
-                            c_away, c_home = st.columns(2)
+    # 3. Botón de Acción
+    st.markdown("---")
+    if st.button("🚀 CALCULAR ENFRENTAMIENTO", type="primary", use_container_width=True):
+        if visita == local:
+            st.error("Elige equipos diferentes.")
+        else:
+            col_res_v, col_res_l = st.columns(2)
+            
+            # Función auxiliar para renderizar cada lado
+            def render_side(col, team_name, rival_name, is_home, color_borde):
+                with col:
+                    st.header(f"{team_name}")
+                    roster = get_active_roster(team_name, min_filter)
+                    
+                    if not roster:
+                        st.warning("No hay jugadores que cumplan el filtro.")
+                    
+                    for p in roster:
+                        # El jugador 'p' juega contra 'rival_name'
+                        res = predict_player(p, rival_name, is_home)
+                        if res:
+                            (pts, reb, ast), pos, opp, b2b, trend, _, _ = res
                             
-                            with c_away:
-                                st.markdown(f"**✈️ {a_abb}**")
-                                roster = get_active_roster(a_id, min_filter)
-                                if not roster: st.caption("Nadie cumple el filtro.")
-                                for p in roster:
-                                    res = predict_player(p, h_abb, False)
-                                    if res:
-                                        (pts, reb, ast), pos, opp = res
-                                        icon = "🛡️" if opp < 15 else ""
-                                        st.write(f"{icon} **{p}** ({pos}): {pts:.1f} PTS | {reb:.1f} REB")
+                            # Iconos
+                            icon_b2b = "💤" if b2b else ""
+                            icon_fire = "🔥" if trend > 3 else ""
+                            icon_shield = "🛡️" if opp < 16 else ""
                             
-                            with c_home:
-                                st.markdown(f"**🏠 {h_abb}**")
-                                roster = get_active_roster(h_id, min_filter)
-                                if not roster: st.caption("Nadie cumple el filtro.")
-                                for p in roster:
-                                    res = predict_player(p, a_abb, True)
-                                    if res:
-                                        (pts, reb, ast), pos, opp = res
-                                        icon = "🛡️" if opp < 15 else ""
-                                        st.write(f"{icon} **{p}** ({pos}): {pts:.1f} PTS | {reb:.1f} REB")
-            except Exception as e:
-                st.error("Error de conexión.")
-                st.code(e)
+                            # Diseño de Tarjeta (Compatible con Modo Oscuro)
+                            st.markdown(f"""
+                            <div style="
+                                background-color: rgba(128, 128, 128, 0.1); 
+                                padding: 10px; 
+                                border-radius: 5px; 
+                                margin-bottom: 10px; 
+                                border-left: 4px solid {color_borde};">
+                                <strong>{p}</strong> <small>({pos})</small> {icon_b2b}{icon_fire}{icon_shield}<br>
+                                <span style="font-size: 18px; font-weight: bold;">🏀 {pts:.1f}</span> | 🙌 {reb:.1f} | 🤝 {ast:.1f}
+                            </div>
+                            """, unsafe_allow_html=True)
+
+            # Renderizar Visitante (Borde Rojo)
+            render_side(col_res_v, visita, local, False, "#cc0000")
+            
+            # Renderizar Local (Borde Azul)
+            render_side(col_res_l, local, visita, True, "#0000cc")
