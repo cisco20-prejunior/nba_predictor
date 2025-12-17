@@ -4,11 +4,15 @@ import numpy as np
 import joblib
 import warnings
 import requests
+import time
 from groq import Groq
 from tensorflow.keras.models import load_model
 from datetime import datetime
 from tavily import TavilyClient
-import time
+
+# --- IMPORTS PARA NBA API ---
+from nba_api.stats.static import players
+from nba_api.stats.endpoints import playergamelog
 
 # --- 0. CONFIGURACIÓN VISUAL Y CSS ---
 warnings.filterwarnings('ignore')
@@ -31,51 +35,29 @@ st.markdown("""
         transition: transform 0.2s;
     }
     
-    /* ESTILOS DE APUESTAS CORREGIDOS */
-    .odds-card {
-        background-color: #1e293b;
+    .prop-card {
+        background-color: #0f172a;
         border: 1px solid #334155;
-        padding: 15px;
         border-radius: 8px;
-        margin-bottom: 15px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-    }
-    .odds-header {
-        font-size: 1.1em;
-        font-weight: bold;
-        color: white;
-        border-bottom: 1px solid #334155;
-        padding-bottom: 8px;
+        padding: 10px;
+        text-align: center;
         margin-bottom: 10px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
     }
-    .comparison-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        background: #0f172a;
-        padding: 8px 12px;
-        border-radius: 6px;
-        margin-bottom: 6px;
-        font-family: sans-serif;
-    }
-    .edge-badge {
-        background-color: #10b981;
-        color: #000;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-weight: 800;
-        font-size: 0.85em;
-        box-shadow: 0 0 5px rgba(16, 185, 129, 0.5);
-    }
-    .no-edge {
-        color: #64748b;
-        font-size: 0.8em;
-        font-style: italic;
-    }
+    .prop-title { color: #94a3b8; font-size: 0.9em; font-weight: bold; text-transform: uppercase; }
+    .prop-line { font-size: 1.8em; font-weight: 900; color: white; margin: 5px 0; }
+    .prop-edge-green { color: #4ade80; font-weight: bold; font-size: 0.9em; }
+    .prop-edge-red { color: #f87171; font-weight: bold; font-size: 0.9em; }
+    .prop-edge-neutral { color: #64748b; font-size: 0.9em; }
     
+    .odds-card { background-color: #1e293b; border: 1px solid #334155; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+    .odds-header { font-size: 1.1em; font-weight: bold; color: white; border-bottom: 1px solid #334155; padding-bottom: 8px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+    .comparison-row { display: flex; justify-content: space-between; align-items: center; background: #0f172a; padding: 8px 12px; border-radius: 6px; margin-bottom: 6px; font-family: sans-serif; }
+    .edge-badge { background-color: #10b981; color: #000; padding: 2px 8px; border-radius: 4px; font-weight: 800; font-size: 0.85em; }
+    .no-edge { color: #64748b; font-size: 0.8em; font-style: italic; }
+    .live-badge { background-color: #ef4444; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.7em; font-weight: bold; margin-left: 5px; animation: pulse 2s infinite; }
+    .rusty-badge { background-color: #7f1d1d; color: #fecaca; padding: 2px 6px; border-radius: 4px; font-size: 0.7em; font-weight: bold; margin-left: 5px; border: 1px solid #ef4444; }
+    
+    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
     .stButton>button { border-radius: 8px; font-weight: bold; border: none; height: 50px; }
     .stTabs [data-baseweb="tab-list"] { gap: 24px; }
     .stTabs [data-baseweb="tab"] { background-color: #1f2937; color: white; border-radius: 4px 4px 0 0; }
@@ -84,58 +66,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- CONSTANTES Y MAPEOS ---
+# --- CONSTANTES ---
 NBA_TEAMS_CURRENT = [
     'ATL', 'BOS', 'BKN', 'CHA', 'CHI', 'CLE', 'DAL', 'DEN', 'DET', 'GSW',
     'HOU', 'IND', 'LAC', 'LAL', 'MEM', 'MIA', 'MIL', 'MIN', 'NOP', 'NYK',
     'OKC', 'ORL', 'PHI', 'PHX', 'POR', 'SAC', 'SAS', 'TOR', 'UTA', 'WAS'
 ]
-
-# DICCIONARIO MAESTRO: NOMBRE API -> ABREVIATURA MODELO
 NAME_TO_ABBR = {
-    'Atlanta Hawks': 'ATL', 'Boston Celtics': 'BOS', 'Brooklyn Nets': 'BKN',
-    'Charlotte Hornets': 'CHA', 'Chicago Bulls': 'CHI', 'Cleveland Cavaliers': 'CLE',
-    'Dallas Mavericks': 'DAL', 'Denver Nuggets': 'DEN', 'Detroit Pistons': 'DET',
-    'Golden State Warriors': 'GSW', 'Houston Rockets': 'HOU', 'Indiana Pacers': 'IND',
-    'Los Angeles Clippers': 'LAC', 'Los Angeles Lakers': 'LAL', 'Memphis Grizzlies': 'MEM',
-    'Miami Heat': 'MIA', 'Milwaukee Bucks': 'MIL', 'Minnesota Timberwolves': 'MIN',
-    'New Orleans Pelicans': 'NOP', 'New York Knicks': 'NYK', 'Oklahoma City Thunder': 'OKC',
-    'Orlando Magic': 'ORL', 'Philadelphia 76ers': 'PHI', 'Phoenix Suns': 'PHX',
-    'Portland Trail Blazers': 'POR', 'Sacramento Kings': 'SAC', 'San Antonio Spurs': 'SAS',
-    'Toronto Raptors': 'TOR', 'Utah Jazz': 'UTA', 'Washington Wizards': 'WAS'
+    'Atlanta Hawks': 'ATL', 'Boston Celtics': 'BOS', 'Brooklyn Nets': 'BKN', 'Charlotte Hornets': 'CHA', 'Chicago Bulls': 'CHI', 'Cleveland Cavaliers': 'CLE', 'Dallas Mavericks': 'DAL', 'Denver Nuggets': 'DEN', 'Detroit Pistons': 'DET', 'Golden State Warriors': 'GSW', 'Houston Rockets': 'HOU', 'Indiana Pacers': 'IND', 'Los Angeles Clippers': 'LAC', 'Los Angeles Lakers': 'LAL', 'Memphis Grizzlies': 'MEM', 'Miami Heat': 'MIA', 'Milwaukee Bucks': 'MIL', 'Minnesota Timberwolves': 'MIN', 'New Orleans Pelicans': 'NOP', 'New York Knicks': 'NYK', 'Oklahoma City Thunder': 'OKC', 'Orlando Magic': 'ORL', 'Philadelphia 76ers': 'PHI', 'Phoenix Suns': 'PHX', 'Portland Trail Blazers': 'POR', 'Sacramento Kings': 'SAC', 'San Antonio Spurs': 'SAS', 'Toronto Raptors': 'TOR', 'Utah Jazz': 'UTA', 'Washington Wizards': 'WAS'
 }
-
 TEAM_LOGOS = {
-    'ATL': 'https://a.espncdn.com/i/teamlogos/nba/500/atl.png',
-    'BOS': 'https://a.espncdn.com/i/teamlogos/nba/500/bos.png',
-    'BKN': 'https://a.espncdn.com/i/teamlogos/nba/500/bkn.png',
-    'CHA': 'https://a.espncdn.com/i/teamlogos/nba/500/cha.png',
-    'CHI': 'https://a.espncdn.com/i/teamlogos/nba/500/chi.png',
-    'CLE': 'https://a.espncdn.com/i/teamlogos/nba/500/cle.png',
-    'DAL': 'https://a.espncdn.com/i/teamlogos/nba/500/dal.png',
-    'DEN': 'https://a.espncdn.com/i/teamlogos/nba/500/den.png',
-    'DET': 'https://a.espncdn.com/i/teamlogos/nba/500/det.png',
-    'GSW': 'https://a.espncdn.com/i/teamlogos/nba/500/gs.png',
-    'HOU': 'https://a.espncdn.com/i/teamlogos/nba/500/hou.png',
-    'IND': 'https://a.espncdn.com/i/teamlogos/nba/500/ind.png',
-    'LAC': 'https://a.espncdn.com/i/teamlogos/nba/500/lac.png',
-    'LAL': 'https://a.espncdn.com/i/teamlogos/nba/500/lal.png',
-    'MEM': 'https://a.espncdn.com/i/teamlogos/nba/500/mem.png',
-    'MIA': 'https://a.espncdn.com/i/teamlogos/nba/500/mia.png',
-    'MIL': 'https://a.espncdn.com/i/teamlogos/nba/500/mil.png',
-    'MIN': 'https://a.espncdn.com/i/teamlogos/nba/500/min.png',
-    'NOP': 'https://a.espncdn.com/i/teamlogos/nba/500/no.png',
-    'NYK': 'https://a.espncdn.com/i/teamlogos/nba/500/ny.png',
-    'OKC': 'https://a.espncdn.com/i/teamlogos/nba/500/okc.png',
-    'ORL': 'https://a.espncdn.com/i/teamlogos/nba/500/orl.png',
-    'PHI': 'https://a.espncdn.com/i/teamlogos/nba/500/phi.png',
-    'PHX': 'https://a.espncdn.com/i/teamlogos/nba/500/phx.png',
-    'POR': 'https://a.espncdn.com/i/teamlogos/nba/500/por.png',
-    'SAC': 'https://a.espncdn.com/i/teamlogos/nba/500/sac.png',
-    'SAS': 'https://a.espncdn.com/i/teamlogos/nba/500/sas.png',
-    'TOR': 'https://a.espncdn.com/i/teamlogos/nba/500/tor.png',
-    'UTA': 'https://a.espncdn.com/i/teamlogos/nba/500/utah.png',
-    'WAS': 'https://a.espncdn.com/i/teamlogos/nba/500/wsh.png'
+    'ATL': 'https://a.espncdn.com/i/teamlogos/nba/500/atl.png', 'BOS': 'https://a.espncdn.com/i/teamlogos/nba/500/bos.png', 'BKN': 'https://a.espncdn.com/i/teamlogos/nba/500/bkn.png', 'CHA': 'https://a.espncdn.com/i/teamlogos/nba/500/cha.png', 'CHI': 'https://a.espncdn.com/i/teamlogos/nba/500/chi.png', 'CLE': 'https://a.espncdn.com/i/teamlogos/nba/500/cle.png', 'DAL': 'https://a.espncdn.com/i/teamlogos/nba/500/dal.png', 'DEN': 'https://a.espncdn.com/i/teamlogos/nba/500/den.png', 'DET': 'https://a.espncdn.com/i/teamlogos/nba/500/det.png', 'GSW': 'https://a.espncdn.com/i/teamlogos/nba/500/gs.png', 'HOU': 'https://a.espncdn.com/i/teamlogos/nba/500/hou.png', 'IND': 'https://a.espncdn.com/i/teamlogos/nba/500/ind.png', 'LAC': 'https://a.espncdn.com/i/teamlogos/nba/500/lac.png', 'LAL': 'https://a.espncdn.com/i/teamlogos/nba/500/lal.png', 'MEM': 'https://a.espncdn.com/i/teamlogos/nba/500/mem.png', 'MIA': 'https://a.espncdn.com/i/teamlogos/nba/500/mia.png', 'MIL': 'https://a.espncdn.com/i/teamlogos/nba/500/mil.png', 'MIN': 'https://a.espncdn.com/i/teamlogos/nba/500/min.png', 'NOP': 'https://a.espncdn.com/i/teamlogos/nba/500/no.png', 'NYK': 'https://a.espncdn.com/i/teamlogos/nba/500/ny.png', 'OKC': 'https://a.espncdn.com/i/teamlogos/nba/500/okc.png', 'ORL': 'https://a.espncdn.com/i/teamlogos/nba/500/orl.png', 'PHI': 'https://a.espncdn.com/i/teamlogos/nba/500/phi.png', 'PHX': 'https://a.espncdn.com/i/teamlogos/nba/500/phx.png', 'POR': 'https://a.espncdn.com/i/teamlogos/nba/500/por.png', 'SAC': 'https://a.espncdn.com/i/teamlogos/nba/500/sac.png', 'SAS': 'https://a.espncdn.com/i/teamlogos/nba/500/sas.png', 'TOR': 'https://a.espncdn.com/i/teamlogos/nba/500/tor.png', 'UTA': 'https://a.espncdn.com/i/teamlogos/nba/500/utah.png', 'WAS': 'https://a.espncdn.com/i/teamlogos/nba/500/wsh.png'
 }
 
 # --- 1. CARGA DE ARTEFACTOS ---
@@ -162,8 +103,25 @@ def load_all_artifacts():
 
 (model_p, scaler_p, pos_map, dvp_stats, df_p, model_t, scaler_t, df_t) = load_all_artifacts()
 
-# --- 2. LÓGICA DE IA & APIS ---
+# --- 2. NBA API (2025-26) ---
+@st.cache_data(ttl=14400, show_spinner=False)
+def obtener_datos_reales_nba(player_name):
+    try:
+        time.sleep(0.6)
+        nba_players = players.find_players_by_full_name(player_name)
+        if not nba_players: return None
+        player_id = nba_players[0]['id']
+        gamelog = playergamelog.PlayerGameLog(player_id=player_id, season='2025-26')
+        df = gamelog.get_data_frames()[0]
+        if df.empty: return None
+        # Traemos 10 partidos para calcular la línea de mercado simulada
+        cols_necesarias = ['GAME_DATE', 'MATCHUP', 'WL', 'PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'MIN', 'FG_PCT', 'FG3_PCT', 'PLUS_MINUS']
+        cols_existentes = [c for c in cols_necesarias if c in df.columns]
+        df_clean = df[cols_existentes].head(10).copy() 
+        return df_clean
+    except Exception: return None
 
+# --- 3. FUNCIONES AUXILIARES ---
 def ask_groq(prompt, api_key):
     if not api_key: return "⚠️ Falta Groq API Key"
     try:
@@ -201,47 +159,31 @@ def consultar_ia_partido(local, visita, j_local, j_visita, groq_key, tavily_key)
     return ask_groq(prompt, groq_key)
 
 def obtener_cuotas_nba(api_key):
-    """Obtiene cuotas reales y las prepara para comparación"""
     if not api_key: return None, "⚠️ Falta The-Odds-API Key"
-    
     url = f'https://api.the-odds-api.com/v4/sports/basketball_nba/odds?regions=us&markets=h2h,spreads,totals&oddsFormat=decimal&apiKey={api_key}'
-    
     try:
         response = requests.get(url)
         if response.status_code != 200: return None, f"Error API: {response.text}"
         data = response.json()
         if not data: return None, "No hay partidos disponibles."
-            
         partidos = []
         for game in data:
-            home = game['home_team']
-            away = game['away_team']
-            
+            home = game['home_team']; away = game['away_team']
             bookmakers = game.get('bookmakers', [])
             if not bookmakers: continue
-            
             bookie = next((b for b in bookmakers if b['key'] == 'draftkings'), bookmakers[0])
-            
             odds = {
                 'home_name': home, 'away_name': away,
-                'home_abbr': NAME_TO_ABBR.get(home),
-                'away_abbr': NAME_TO_ABBR.get(away),
-                'bookie': bookie['title'],
-                'total_line': None, 'spread_line': None, 'spread_team': None
+                'home_abbr': NAME_TO_ABBR.get(home), 'away_abbr': NAME_TO_ABBR.get(away),
+                'bookie': bookie['title'], 'total_line': None, 'spread_line': None
             }
-            
             for market in bookie.get('markets', []):
-                if market['key'] == 'totals':
-                    odds['total_line'] = market['outcomes'][0]['point']
-                elif market['key'] == 'spreads':
-                    odds['spread_line'] = market['outcomes'][0]['point']
-                    odds['spread_team'] = market['outcomes'][0]['name']
-            
+                if market['key'] == 'totals': odds['total_line'] = market['outcomes'][0]['point']
+                elif market['key'] == 'spreads': odds['spread_line'] = market['outcomes'][0]['point']
             partidos.append(odds)
         return partidos, None
     except Exception as e: return None, str(e)
 
-# --- 3. FUNCIONES MATEMÁTICAS ---
 def get_team_recent_stats(team_abbr):
     team_data = df_t[df_t['TEAM_ABBREVIATION'] == team_abbr].sort_values('GAME_DATE')
     if team_data.empty: return None
@@ -290,20 +232,54 @@ def predict_player(name, rival, is_home):
     if ph.empty: return None
     last = ph.tail(1)
     today = pd.to_datetime(datetime.now().strftime('%Y-%m-%d'))
-    last_date = last['GAME_DATE'].values[0]
-    ds = (today - last_date).days
-    inactive = True if ds > 30 else False
     pos = pos_map.get(last['PLAYER_ID'].values[0], 'F')
     opp = get_defense_stats(rival, pos)
-    stats = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'MIN', 'FG_PCT', 'FG3_PCT']
-    feats = [f'AVG_{s}_LAST_5' for s in stats]
+    
+    live_df = obtener_datos_reales_nba(name)
+    row = last.copy()
+    days_inactive = 0
+    inactive_flag = False
+    stats_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'MIN', 'FG_PCT', 'FG3_PCT']
+    
+    # Valores de Mercado (Simulados)
+    m_pts, m_reb, m_ast = 0.0, 0.0, 0.0
+    
+    if live_df is not None and not live_df.empty:
+        last_game_date = pd.to_datetime(live_df.iloc[0]['GAME_DATE'])
+        days_inactive = (today - last_game_date).days
+        inactive_flag = True if days_inactive > 14 else False
+        
+        # Calcular Features para IA
+        for s in stats_cols:
+            if s in live_df.columns: row[f'AVG_{s}_LAST_5'] = live_df[s].head(5).mean()
+        if 'PTS' in live_df.columns: row['TREND_PTS'] = live_df.iloc[0]['PTS'] - live_df['PTS'].head(5).mean()
+        if 'FG_PCT' in live_df.columns: row['TREND_FG_PCT'] = live_df.iloc[0]['FG_PCT'] - live_df['FG_PCT'].head(5).mean()
+        l5 = live_df.head(5)
+        
+        # --- CALCULAR LÍNEAS DE MERCADO (Promedio últimos 10) ---
+        m_pts = live_df['PTS'].mean()
+        m_reb = live_df['REB'].mean()
+        m_ast = live_df['AST'].mean()
+        
+    else:
+        last_date_csv = pd.to_datetime(last['GAME_DATE'].values[0])
+        days_inactive = (today - last_date_csv).days
+        inactive_flag = True if days_inactive > 30 else False
+        l5 = ph.tail(5).sort_values(by='GAME_DATE', ascending=False)
+        # Fallback mercado
+        m_pts = ph['PTS'].tail(10).mean()
+        m_reb = ph['REB'].tail(10).mean()
+        m_ast = ph['AST'].tail(10).mean()
+
+    feats = [f'AVG_{s}_LAST_5' for s in stats_cols]
     trends = ['TREND_PTS', 'TREND_FG_PCT']
     extra_cols = ['IS_HOME', 'DAYS_REST', 'IS_B2B', 'OPP_ALLOW_PTS', 'OPP_ALLOW_REB', 'OPP_ALLOW_AST']
     all_cols = feats + trends + extra_cols
+    
     try:
-        row = last.copy()
         row['IS_HOME'] = 1 if is_home else 0
-        row['DAYS_REST'] = 2; row['IS_B2B'] = 0
+        row['DAYS_REST'] = min(days_inactive, 5)
+        row['IS_B2B'] = 1 if days_inactive == 1 else 0
         row['OPP_ALLOW_PTS'] = opp[0]; row['OPP_ALLOW_REB'] = opp[1]; row['OPP_ALLOW_AST'] = opp[2]
         missing = [c for c in all_cols if c not in row.columns]
         for c in missing: row[c] = 0
@@ -312,10 +288,11 @@ def predict_player(name, rival, is_home):
         pred_pts = float(pred[0][0])
         pred_reb = float(pred[0][1])
         pred_ast = float(pred[0][2])
-        tr = last.get('TREND_PTS', pd.Series([0])).values[0]
-        l5 = ph.tail(5).sort_values(by='GAME_DATE', ascending=False)
+        tr = row.get('TREND_PTS', pd.Series([0])).values[0]
         pid = last['PLAYER_ID'].values[0]
-        return (pred_pts, pred_reb, pred_ast), pos, opp, float(tr), l5, pid, inactive, ds
+        
+        # Devolvemos también las líneas simuladas
+        return (pred_pts, pred_reb, pred_ast), pos, opp, float(tr), l5, pid, inactive_flag, days_inactive, (m_pts, m_reb, m_ast)
     except Exception as e: return None
 
 # --- 4. INTERFAZ GRÁFICA (UI) ---
@@ -327,7 +304,7 @@ with st.sidebar:
     k_tavily = st.text_input("Tavily Key", type="password")
     k_odds = st.text_input("The-Odds-API Key", type="password")
     st.markdown("### ⚙️ Filtros")
-    min_min = st.slider("Minutos Mínimos", 10, 40, 20)
+    min_min = st.slider("Minutos Mínimos", 10, 40, 25)
 
 st.markdown("<h1 style='text-align: center;'>🏀 NBA AI PREDICTOR</h1>", unsafe_allow_html=True)
 
@@ -383,24 +360,50 @@ with tab1:
                 for p in roster:
                     res = predict_player(p, rival, is_home)
                     if res:
-                        (pts, reb, ast), pos, (opp_pts, opp_reb, opp_ast), trend, l5, pid, inact, _ = res
+                        (pts, reb, ast), pos, (opp_pts, opp_reb, opp_ast), trend, l5, pid, inact, days_inactive, (m_pts, m_reb, m_ast) = res
                         fire = "🔥" if trend > 3 else ""
-                        alert = "🚨 Inactivo" if inact else ""
                         dvp_color = "green" if opp_pts > 22 else ("red" if opp_pts < 18 else "gray")
                         
-                        label = f"{p} ({pos}) | 🏀 {pts:.1f} PTS | {fire} {alert}"
+                        days_inactive_txt = ""
+                        card_style_border = "1px solid #374151"
+                        if inact:
+                            days_inactive_txt = f"<span class='rusty-badge'>💤 {days_inactive} días inactivo</span>"
+                            card_style_border = "2px solid #ef4444"
+                        elif days_inactive > 5:
+                            days_inactive_txt = f"<span style='color:#fbbf24; font-size:0.8em; margin-left:5px'>({days_inactive}d descanso)</span>"
+
+                        label = f"{p} ({pos}) | 🏀 {pts:.1f} PTS | {fire} {days_inactive_txt}"
+                        st.markdown(f"<style>div[data-testid='stExpander'] details summary {{ border: {card_style_border} !important; }}</style>", unsafe_allow_html=True)
                         
                         with st.expander(label):
                             c_img, c_stats = st.columns([1, 3])
-                            with c_img:
-                                st.image(f"https://cdn.nba.com/headshots/nba/latest/1040x760/{int(pid)}.png", width=100)
-                                st.caption(f"Trend: {trend:.1f}")
+                            with c_img: st.image(f"https://cdn.nba.com/headshots/nba/latest/1040x760/{int(pid)}.png", width=100)
                             with c_stats:
                                 m1, m2, m3 = st.columns(3)
                                 m1.metric("Puntos", f"{pts:.1f}")
                                 m2.metric("Rebotes", f"{reb:.1f}")
                                 m3.metric("Asistencias", f"{ast:.1f}")
-                                st.markdown(f"**Defensa {rival} vs {pos}:** <span style='color:{dvp_color}'>{opp_pts:.1f} pts</span>", unsafe_allow_html=True)
+                                
+                                st.markdown("##### 🎰 Generador de Props (Simulados)")
+                                p1, p2, p3 = st.columns(3)
+                                
+                                def render_prop(title, ai_val, market_val):
+                                    diff = ai_val - market_val
+                                    color = "prop-edge-green" if diff > 1.5 else ("prop-edge-red" if diff < -1.5 else "prop-edge-neutral")
+                                    action = "OVER" if diff > 0 else "UNDER"
+                                    html = f"""
+                                    <div class="prop-card">
+                                        <div class="prop-title">{title}</div>
+                                        <div class="prop-line">{market_val:.1f}</div>
+                                        <div style="font-size:0.8em; color:#94a3b8">IA: {ai_val:.1f}</div>
+                                        <div class="{color}">{action} ({diff:+.1f})</div>
+                                    </div>
+                                    """
+                                    return html
+
+                                p1.markdown(render_prop("Puntos", pts, m_pts), unsafe_allow_html=True)
+                                p2.markdown(render_prop("Rebotes", reb, m_reb), unsafe_allow_html=True)
+                                p3.markdown(render_prop("Asistencias", ast, m_ast), unsafe_allow_html=True)
                             
                             t_stats, t_vs = st.tabs(["📅 Últimos 5", "⚔️ Vs Rival"])
                             with t_stats: st.dataframe(l5[['GAME_DATE', 'MATCHUP', 'PTS', 'REB', 'AST', 'MIN']], hide_index=True)
@@ -434,7 +437,7 @@ with tab2:
     if st.button("🔮 Predecir"):
         res = predict_player(p_name, p_riv, p_loc == "Casa 🏠")
         if res:
-            (pts, reb, ast), pos, _, trend, l5, pid, inact, d_out = res
+            (pts, reb, ast), pos, _, trend, l5, pid, inact, days_inactive, (m_pts, m_reb, m_ast) = res
             cpic, cdata = st.columns([1, 3])
             with cpic: st.image(f"https://cdn.nba.com/headshots/nba/latest/1040x760/{int(pid)}.png")
             with cdata:
@@ -443,44 +446,59 @@ with tab2:
                 m1.metric("Puntos", f"{pts:.1f}", f"{trend:.1f}")
                 m2.metric("Rebotes", f"{reb:.1f}")
                 m3.metric("Asistencias", f"{ast:.1f}")
+                
+                st.markdown("### 🎰 Props Simulados (IA vs Mercado)")
+                
+                def render_large_prop(title, ai, market):
+                    diff = ai - market
+                    color = "#4ade80" if diff > 1.5 else ("#f87171" if diff < -1.5 else "gray")
+                    icon = "🚀" if diff > 0 else "📉"
+                    rec = "OVER" if diff > 0 else "UNDER"
+                    return f"""
+                    <div style="background:#0f172a; padding:15px; border-radius:10px; margin-bottom:10px; border:1px solid #334155">
+                        <div style="color:#94a3b8; font-weight:bold">{title}</div>
+                        <div style="display:flex; justify-content:space-between; align-items:center">
+                            <div style="font-size:1.5em; font-weight:900; color:white">{market:.1f}</div>
+                            <div style="text-align:right">
+                                <div style="color:white">IA: {ai:.1f}</div>
+                                <div style="color:{color}; font-weight:bold">{icon} {rec} ({diff:+.1f})</div>
+                            </div>
+                        </div>
+                    </div>
+                    """
+                
+                c1, c2, c3 = st.columns(3)
+                c1.markdown(render_large_prop("PUNTOS", pts, m_pts), unsafe_allow_html=True)
+                c2.markdown(render_large_prop("REBOTES", reb, m_reb), unsafe_allow_html=True)
+                c3.markdown(render_large_prop("ASISTENCIAS", ast, m_ast), unsafe_allow_html=True)
+
             st.markdown("### Historial vs Rival")
             vs_rival = get_player_vs_rival(p_name, p_riv)
             if not vs_rival.empty: st.dataframe(vs_rival[['GAME_DATE', 'MATCHUP', 'PTS', 'REB', 'AST']], hide_index=True)
             else: st.info("Sin historial reciente.")
 
-# === PESTAÑA 3: COMPARADOR IA VS VEGAS (CORREGIDO) ===
+# === PESTAÑA 3 ===
 with tab3:
     st.markdown("## 💰 Detector de Valor (Edge)")
     st.caption("Compara la predicción de tu IA contra las líneas de Las Vegas en tiempo real.")
-    
     if st.button("🔄 Buscar Cuotas y Calcular Edge", type="primary"):
-        if not k_odds:
-            st.error("⚠️ Falta The-Odds-API Key en la barra lateral.")
+        if not k_odds: st.error("⚠️ Falta The-Odds-API Key en la barra lateral.")
         else:
             with st.spinner("📡 Obteniendo cuotas y ejecutando simulaciones IA..."):
                 partidos, error = obtener_cuotas_nba(k_odds)
-                
-                if error:
-                    st.error(error)
+                if error: st.error(error)
                 else:
                     for p in partidos:
-                        ai_total_txt = "N/A"
-                        edge_badge = ""
-                        
+                        ai_total_txt = "N/A"; edge_badge = ""
                         if p['home_abbr'] and p['away_abbr']:
                             sv, sl, _, _ = predecir_marcador(p['away_abbr'], p['home_abbr'])
                             if sv and sl:
-                                ai_total = sv + sl
-                                ai_total_txt = f"{ai_total:.1f}"
-                                
+                                ai_total = sv + sl; ai_total_txt = f"{ai_total:.1f}"
                                 if p['total_line']:
                                     diff = ai_total - p['total_line']
                                     if abs(diff) > 4:
                                         rec = "OVER ⬆️" if diff > 0 else "UNDER ⬇️"
                                         edge_badge = f"<span class='edge-badge'>✅ {rec} ({diff:+.1f})</span>"
-                                    else:
-                                        edge_badge = "<span class='no-edge'>Sin ventaja</span>"
-
+                                    else: edge_badge = "<span class='no-edge'>Sin ventaja</span>"
                         html_odds = f"""<div class="odds-card"><div class="odds-header"><span>{p['away_name']} vs {p['home_name']}</span><span style="font-size:0.8em; color:#10b981">{p['bookie']}</span></div><div class="comparison-row"><span>🔢 <b>Total (O/U)</b></span>{edge_badge}</div><div class="comparison-row" style="background:#1e293b"><span>🏛️ Vegas: <b>{p['total_line']}</b></span><span>🤖 IA Predice: <b>{ai_total_txt}</b></span></div></div>"""
-                        
                         st.markdown(html_odds, unsafe_allow_html=True)
